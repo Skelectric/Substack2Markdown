@@ -29,10 +29,10 @@ specify them as command line arguments.
 Clone the repo and install the dependencies:
 
 ```bash
-git clone https://github.com/yourusername/substack_scraper.git
-cd substack_scraper
+git clone https://github.com/yourusername/Substack2Markdown
+cd Substack2Markdown
 
-# # Optinally create a virtual environment
+# # Optionally create a virtual environment
 # python -m venv venv
 # # Activate the virtual environment
 # .\venv\Scripts\activate  # Windows
@@ -48,7 +48,7 @@ EMAIL = "your-email@domain.com"
 PASSWORD = "your-password"
 ```
 
-You'll also need Microsoft Edge installed for the Selenium webdriver.
+You'll also need Brave Browser installed for the Selenium webdriver (ChromeDriver will be automatically managed).
 
 ## Usage
 
@@ -70,6 +70,8 @@ For premium Substack sites:
 ```bash
 python substack_scraper.py --url https://example.substack.com --directory /path/to/save/posts --premium
 ```
+
+**Note:** For premium content, you may need to complete a captcha or handle popups manually in the browser window that opens.
 
 To scrape a specific number of posts:
 

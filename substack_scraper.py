@@ -14,8 +14,8 @@ from xml.etree import ElementTree as ET
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
-from selenium.webdriver.edge.options import Options as EdgeOptions
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service
 from urllib.parse import urlparse
 from config import EMAIL, PASSWORD
@@ -367,51 +367,110 @@ class PremiumSubstackScraper(BaseSubstackScraper):
             md_save_dir: str,
             html_save_dir: str,
             headless: bool = False,
-            edge_path: str = '',
-            edge_driver_path: str = '',
+            chrome_path: str = '',
+            chrome_driver_path: str = '',
             user_agent: str = ''
     ) -> None:
         super().__init__(base_substack_url, md_save_dir, html_save_dir)
 
-        options = EdgeOptions()
+        options = ChromeOptions()
         if headless:
             options.add_argument("--headless")
-        if edge_path:
-            options.binary_location = edge_path
+        if chrome_path:
+            options.binary_location = chrome_path
         if user_agent:
             options.add_argument(f'user-agent={user_agent}')  # Pass this if running headless and blocked by captcha
 
-        if edge_driver_path:
-            service = Service(executable_path=edge_driver_path)
-        else:
-            service = Service(EdgeChromiumDriverManager().install())
+        # Add Brave-specific options
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--remote-debugging-port=9222")
 
-        self.driver = webdriver.Edge(service=service, options=options)
+        if chrome_driver_path:
+            service = Service(executable_path=chrome_driver_path)
+        else:
+            # Try to use the Homebrew-installed ChromeDriver first
+            homebrew_chromedriver = "/opt/homebrew/bin/chromedriver"
+            if os.path.exists(homebrew_chromedriver):
+                service = Service(executable_path=homebrew_chromedriver)
+            else:
+                service = Service(ChromeDriverManager().install())
+
+        self.driver = webdriver.Chrome(service=service, options=options)
         self.login()
 
     def login(self) -> None:
         """
         This method logs into Substack using Selenium
         """
+        print("Starting login process...")
         self.driver.get("https://substack.com/sign-in")
-        sleep(3)
+        sleep(5)
 
-        signin_with_password = self.driver.find_element(
-            By.XPATH, "//a[@class='login-option substack-login__login-option']"
-        )
-        signin_with_password.click()
-        sleep(3)
+        try:
+            signin_with_password = self.driver.find_element(
+                By.XPATH, "//a[@class='login-option substack-login__login-option']"
+            )
+            signin_with_password.click()
+            sleep(3)
+        except Exception as e:
+            print(f"Could not find sign-in with password option: {e}")
+            # Try alternative selectors
+            try:
+                signin_with_password = self.driver.find_element(By.XPATH, "//button[contains(text(), 'Sign in with password')]")
+                signin_with_password.click()
+                sleep(3)
+            except:
+                print("Proceeding with current page...")
 
         # Email and password
         email = self.driver.find_element(By.NAME, "email")
         password = self.driver.find_element(By.NAME, "password")
+        email.clear()
         email.send_keys(EMAIL)
+        password.clear()
         password.send_keys(PASSWORD)
 
         # Find the submit button and click it.
         submit = self.driver.find_element(By.XPATH, "//*[@id=\"substack-login\"]/div[2]/div[2]/form/button")
         submit.click()
-        sleep(30)  # Wait for the page to load
+        print("Login submitted, waiting for verification...")
+        sleep(5)  # Wait for initial response
+        
+        # Wait for potential captcha completion and manual intervention
+        print("⏳ Waiting for login process to complete...")
+        print("If you see a captcha, popup, or need to click login, please handle it now.")
+        
+        # Wait for successful login
+        max_wait = 60  # Maximum wait time in seconds
+        wait_time = 0
+        login_successful = False
+        
+        while wait_time < max_wait:
+            try:
+                current_url = self.driver.current_url
+                print(f"Current URL: {current_url}")
+                
+                # Check if we've left the sign-in page
+                if "substack.com" in current_url and "sign-in" not in current_url:
+                    print("✓ Login successful")
+                    login_successful = True
+                    break
+                
+                # Check for error messages
+                error_elements = self.driver.find_elements(By.XPATH, "//*[contains(@class, 'error') or contains(text(), 'Invalid')]")
+                if error_elements:
+                    print(f"✗ Login error: {[e.text for e in error_elements if e.text]}")
+                    
+            except Exception as e:
+                print(f"Error checking login status: {e}")
+            
+            sleep(10)
+            wait_time += 10
+            
+        if not login_successful:
+            print("⚠ Login verification timeout - proceeding anyway")
 
         if self.is_login_failed():
             raise Exception(
@@ -419,6 +478,64 @@ class PremiumSubstackScraper(BaseSubstackScraper):
                 "Use the non-premium scraper for the non-paid posts. \n"
                 "If running headless, run non-headlessly to see if blocked by Captcha."
             )
+        
+        print("Login process completed.")
+
+    def close_popups(self) -> None:
+        """
+        Close any popups or modals that might be blocking the interface
+        """
+        try:
+            # Look for close buttons (X buttons) in various common locations
+            close_selectors = [
+                "//button[contains(@class, 'close')]",
+                "//button[contains(@aria-label, 'close')]",
+                "//button[contains(@aria-label, 'Close')]",
+                "//*[contains(@class, 'close-button')]",
+                "//*[contains(@class, 'modal-close')]",
+                "//button[text()='×']",
+                "//button[text()='✕']",
+                "//*[@role='button' and contains(@class, 'close')]"
+            ]
+            
+            for selector in close_selectors:
+                close_buttons = self.driver.find_elements(By.XPATH, selector)
+                for button in close_buttons:
+                    if button.is_displayed() and button.is_enabled():
+                        print("🔘 Closing popup/modal...")
+                        button.click()
+                        sleep(2)
+                        return
+                        
+        except Exception as e:
+            print(f"Error closing popups: {e}")
+
+    def click_login_if_needed(self) -> None:
+        """
+        Click login button if it's visible and we're not already logged in
+        """
+        try:
+            # Look for login buttons in various common locations
+            login_selectors = [
+                "//button[contains(text(), 'Login')]",
+                "//a[contains(text(), 'Login')]",
+                "//button[contains(text(), 'Sign in')]",
+                "//a[contains(text(), 'Sign in')]",
+                "//*[contains(text(), 'Already a paid subscriber? Sign in')]"
+            ]
+            
+            for selector in login_selectors:
+                login_buttons = self.driver.find_elements(By.XPATH, selector)
+                for button in login_buttons:
+                    if button.is_displayed() and button.is_enabled():
+                        print("🔘 Clicking login button...")
+                        button.click()
+                        sleep(3)
+                        return
+                        
+        except Exception as e:
+            print(f"Error clicking login button: {e}")
+
 
     def is_login_failed(self) -> bool:
         """
@@ -432,8 +549,20 @@ class PremiumSubstackScraper(BaseSubstackScraper):
         Gets soup from URL using logged in selenium driver
         """
         try:
+            print(f"Loading premium content from: {url}")
             self.driver.get(url)
-            return BeautifulSoup(self.driver.page_source, "html.parser")
+            
+            # Wait for the page to load
+            sleep(1)
+
+            self.click_login_if_needed()
+            
+            # Additional wait to ensure content is fully loaded
+            sleep(1)
+            
+            soup = BeautifulSoup(self.driver.page_source, "html.parser")
+            
+            return soup
         except Exception as e:
             raise ValueError(f"Error fetching page: {e}") from e
 
@@ -466,16 +595,16 @@ def parse_args() -> argparse.Namespace:
         "Scraper.",
     )
     parser.add_argument(
-        "--edge-path",
+        "--chrome-path",
         type=str,
-        default="",
-        help='Optional: The path to the Edge browser executable (i.e. "path_to_msedge.exe").',
+        default="/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        help='Optional: The path to the Chrome/Brave browser executable. Defaults to Brave Browser on macOS.',
     )
     parser.add_argument(
-        "--edge-driver-path",
+        "--chrome-driver-path",
         type=str,
-        default="",
-        help='Optional: The path to the Edge WebDriver executable (i.e. "path_to_msedgedriver.exe").',
+        default="/opt/homebrew/bin/chromedriver",
+        help='Optional: The path to the Chrome WebDriver executable. Defaults to Homebrew installation.',
     )
     parser.add_argument(
         "--user-agent",
@@ -508,7 +637,10 @@ def main():
                 args.url,
                 headless=args.headless,
                 md_save_dir=args.directory,
-                html_save_dir=args.html_directory
+                html_save_dir=args.html_directory,
+                chrome_path=args.chrome_path,
+                chrome_driver_path=args.chrome_driver_path,
+                user_agent=args.user_agent
             )
         else:
             scraper = SubstackScraper(
@@ -524,8 +656,9 @@ def main():
                 base_substack_url=BASE_SUBSTACK_URL,
                 md_save_dir=args.directory,
                 html_save_dir=args.html_directory,
-                edge_path=args.edge_path,
-                edge_driver_path=args.edge_driver_path
+                chrome_path=args.chrome_path,
+                chrome_driver_path=args.chrome_driver_path,
+                user_agent=args.user_agent
             )
         else:
             scraper = SubstackScraper(
