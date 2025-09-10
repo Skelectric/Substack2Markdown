@@ -11,18 +11,41 @@ installation required! (Works for free Substacks only.)
 ![Substack2Markdown Interface](./assets/images/screenshot.png)
 
 Once you run the script, it will create a folder named after the substack in `/substack_md_files`,
-and then begin to scrape the substack URL, converting the blog posts into markdown files. Once all the posts have been
-saved, it will generate an HTML file in `/substack_html_pages` directory that allows you to browse the posts.
+and then begin to scrape the substack URL, converting the blog posts into markdown files. The script automatically
+downloads all images referenced in the articles and saves them locally in an `images/` subdirectory, replacing
+the original URLs with local paths for offline viewing. Once all the posts have been saved, it will generate an 
+HTML file in `/substack_html_pages` directory that allows you to browse the posts.
 
 You can either hardcode the substack URL and the number of posts you'd like to save into the top of the file, or 
 specify them as command line arguments.
 
+## File Structure
+
+The script creates the following directory structure:
+
+```
+substack_md_files/
+└── author_name/
+    ├── 2024-10-01_article-title.md
+    ├── 2024-10-02_another-article.md
+    └── images/
+        ├── 3abb814d.png
+        ├── cdba8659.jpeg
+        └── ...
+```
+
+- **Markdown files**: Saved with date prefixes for easy sorting
+- **Images directory**: Contains all downloaded images with unique filenames
+- **Self-contained**: Markdown files reference images using relative paths (`images/filename.png`)
+
 ## Features
 
 - Converts Substack posts into Markdown files.
+- **Automatically downloads and localizes images** from articles for offline viewing.
 - Generates an HTML file to browse Markdown files.
 - Supports free and premium content (with subscription).
 - The HTML interface allows sorting essays by date or likes.
+- Creates self-contained markdown files with local image references.
 
 ## Installation
 

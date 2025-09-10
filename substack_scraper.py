@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 from time import sleep
 from datetime import datetime
 import re
+import hashlib
 
 from bs4 import BeautifulSoup
 import html2text
@@ -19,7 +20,7 @@ from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from config import EMAIL, PASSWORD
 
 USE_PREMIUM: bool = False  # Set to True if you want to login to Substack and convert paid for posts
@@ -241,6 +242,86 @@ class BaseSubstackScraper(ABC):
         """
         return markdown.markdown(md_content, extensions=['extra'])
 
+    def create_images_directory(self) -> str:
+        """
+        Creates an images directory alongside the markdown files
+        """
+        images_dir = os.path.join(self.md_save_dir, "images")
+        if not os.path.exists(images_dir):
+            os.makedirs(images_dir)
+            print(f"Created images directory: {images_dir}")
+        return images_dir
+
+    def extract_image_urls_from_markdown(self, markdown_content: str) -> List[str]:
+        """
+        Extracts all image URLs from markdown content
+        """
+        # Pattern to match markdown image syntax: ![alt text](url)
+        # This pattern specifically looks for ![...](url) which is markdown image syntax
+        image_pattern = r'!\[[^\]]*\]\((https?://[^\s\)]+)\)'
+        urls = re.findall(image_pattern, markdown_content)
+        return urls
+
+    def download_image(self, image_url: str, images_dir: str) -> Optional[str]:
+        """
+        Downloads an image from URL and saves it locally
+        Returns the local file path if successful, None if failed
+        """
+        try:
+            # Create a unique filename based on URL hash
+            url_hash = hashlib.md5(image_url.encode()).hexdigest()[:8]
+            
+            # Get file extension from URL or default to .jpg
+            parsed_url = urlparse(image_url)
+            path = parsed_url.path
+            if '.' in path:
+                ext = os.path.splitext(path)[1]
+                if not ext or len(ext) > 5:  # Invalid or too long extension
+                    ext = '.jpg'
+            else:
+                ext = '.jpg'
+            
+            filename = f"{url_hash}{ext}"
+            local_path = os.path.join(images_dir, filename)
+            
+            # Skip if file already exists
+            if os.path.exists(local_path):
+                return local_path
+            
+            # Download the image
+            response = requests.get(image_url, stream=True, timeout=30)
+            response.raise_for_status()
+            
+            # Save the image
+            with open(local_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            return local_path
+            
+        except Exception as e:
+            print(f"Failed to download image {image_url}: {e}")
+            return None
+
+    def replace_image_urls_in_markdown(self, markdown_content: str, images_dir: str) -> str:
+        """
+        Replaces image URLs in markdown content with relative local paths
+        """
+        image_urls = self.extract_image_urls_from_markdown(markdown_content)
+        
+        for image_url in image_urls:
+            local_path = self.download_image(image_url, images_dir)
+            if local_path:
+                # Calculate relative path from markdown file to image
+                relative_path = os.path.relpath(local_path, self.md_save_dir)
+                # Ensure forward slashes for markdown compatibility
+                relative_path = relative_path.replace("\\", "/")
+                
+                # Replace the URL in markdown content
+                markdown_content = markdown_content.replace(image_url, relative_path)
+        
+        return markdown_content
+
 
     def save_to_html_file(self, filepath: str, content: str) -> None:
         """
@@ -375,6 +456,10 @@ class BaseSubstackScraper(ABC):
         essays_data = []
         count = 0
         total = num_posts_to_scrape if num_posts_to_scrape != 0 else len(self.post_urls)
+        
+        # Create images directory
+        images_dir = self.create_images_directory()
+        
         for url in tqdm(self.post_urls, total=total):
             try:
                 # First get the post data to extract the date
@@ -384,6 +469,9 @@ class BaseSubstackScraper(ABC):
                     continue
                 
                 title, subtitle, like_count, date, md = self.extract_post_data(soup)
+                
+                # Download images and replace URLs in markdown
+                md = self.replace_image_urls_in_markdown(md, images_dir)
                 
                 # Generate filenames with date prefix
                 md_filename = self.get_filename_from_url(url, filetype=".md", date=date)
