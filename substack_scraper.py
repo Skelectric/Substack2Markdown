@@ -4,6 +4,8 @@ import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 from time import sleep
+from datetime import datetime
+import re
 
 from bs4 import BeautifulSoup
 import html2text
@@ -33,6 +35,68 @@ def extract_main_part(url: str) -> str:
     parts = urlparse(url).netloc.split('.')  # Parse the URL to get the netloc, and split on '.'
     return parts[1] if parts[0] == 'www' else parts[0]  # Return the main part of the domain, while ignoring 'www' if
     # present
+
+
+def parse_date_to_iso(date_str: str) -> str:
+    """
+    Parse various date formats from Substack and convert to YYYY-MM-DD format.
+    Returns the original string if parsing fails.
+    """
+    if not date_str or date_str == "Date not found":
+        return ""
+    
+    # Common Substack date formats to try
+    date_formats = [
+        "%B %d, %Y",      # "January 15, 2024"
+        "%b %d, %Y",      # "Jan 15, 2024"
+        "%d %B %Y",       # "15 January 2024"
+        "%d %b %Y",       # "15 Jan 2024"
+        "%Y-%m-%d",       # "2024-01-15"
+        "%m/%d/%Y",       # "01/15/2024"
+        "%d/%m/%Y",       # "15/01/2024"
+        "%B %d",          # "January 15" (assume current year)
+        "%b %d",          # "Jan 15" (assume current year)
+    ]
+    
+    for fmt in date_formats:
+        try:
+            parsed_date = datetime.strptime(date_str.strip(), fmt)
+            # If no year in format, assume current year
+            if parsed_date.year == 1900:  # Default year when not specified
+                parsed_date = parsed_date.replace(year=datetime.now().year)
+            return parsed_date.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    
+    # If all parsing fails, try to extract year, month, day using regex
+    year_match = re.search(r'\b(20\d{2})\b', date_str)
+    month_match = re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b', date_str.lower())
+    day_match = re.search(r'\b(\d{1,2})\b', date_str)
+    
+    if year_match and month_match and day_match:
+        try:
+            year = int(year_match.group(1))
+            month_name = month_match.group(1)
+            day = int(day_match.group(1))
+            
+            # Convert month name to number
+            month_map = {
+                'january': 1, 'jan': 1, 'february': 2, 'feb': 2,
+                'march': 3, 'mar': 3, 'april': 4, 'apr': 4,
+                'may': 5, 'june': 6, 'jun': 6, 'july': 7, 'jul': 7,
+                'august': 8, 'aug': 8, 'september': 9, 'sep': 9,
+                'october': 10, 'oct': 10, 'november': 11, 'nov': 11,
+                'december': 12, 'dec': 12
+            }
+            month = month_map.get(month_name.lower(), 1)
+            
+            parsed_date = datetime(year, month, day)
+            return parsed_date.strftime("%Y-%m-%d")
+        except (ValueError, KeyError):
+            pass
+    
+    # If all else fails, return the original string
+    return date_str
 
 
 def generate_html_file(author_name: str) -> None:
@@ -214,9 +278,9 @@ class BaseSubstackScraper(ABC):
             file.write(html_content)
 
     @staticmethod
-    def get_filename_from_url(url: str, filetype: str = ".md") -> str:
+    def get_filename_from_url(url: str, filetype: str = ".md", date: str = "") -> str:
         """
-        Gets the filename from the URL (the ending)
+        Gets the filename from the URL (the ending) with optional date prefix
         """
         if not isinstance(url, str):
             raise ValueError("url must be a string")
@@ -227,7 +291,15 @@ class BaseSubstackScraper(ABC):
         if not filetype.startswith("."):
             filetype = f".{filetype}"
 
-        return url.split("/")[-1] + filetype
+        base_filename = url.split("/")[-1]
+        
+        # If date is provided, prepend it to the filename
+        if date:
+            parsed_date = parse_date_to_iso(date)
+            if parsed_date and parsed_date != date:  # Only use if parsing was successful
+                return f"{parsed_date}_{base_filename}{filetype}"
+        
+        return base_filename + filetype
 
     @staticmethod
     def combine_metadata_and_content(title: str, subtitle: str, date: str, like_count: str, content) -> str:
@@ -305,17 +377,21 @@ class BaseSubstackScraper(ABC):
         total = num_posts_to_scrape if num_posts_to_scrape != 0 else len(self.post_urls)
         for url in tqdm(self.post_urls, total=total):
             try:
-                md_filename = self.get_filename_from_url(url, filetype=".md")
-                html_filename = self.get_filename_from_url(url, filetype=".html")
+                # First get the post data to extract the date
+                soup = self.get_url_soup(url)
+                if soup is None:
+                    total += 1
+                    continue
+                
+                title, subtitle, like_count, date, md = self.extract_post_data(soup)
+                
+                # Generate filenames with date prefix
+                md_filename = self.get_filename_from_url(url, filetype=".md", date=date)
+                html_filename = self.get_filename_from_url(url, filetype=".html", date=date)
                 md_filepath = os.path.join(self.md_save_dir, md_filename)
                 html_filepath = os.path.join(self.html_save_dir, html_filename)
 
                 if not os.path.exists(md_filepath):
-                    soup = self.get_url_soup(url)
-                    if soup is None:
-                        total += 1
-                        continue
-                    title, subtitle, like_count, date, md = self.extract_post_data(soup)
                     self.save_to_file(md_filepath, md)
 
                     # Convert markdown to HTML and save
