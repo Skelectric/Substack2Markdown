@@ -24,9 +24,9 @@ from urllib.parse import urlparse, urljoin
 from config import EMAIL, PASSWORD
 
 USE_PREMIUM: bool = False  # Set to True if you want to login to Substack and convert paid for posts
-BASE_SUBSTACK_URL: str = "https://www.thefitzwilliam.com/"  # Substack you want to convert to markdown
-BASE_MD_DIR: str = "substack_md_files"  # Name of the directory we'll save the .md essay files
-BASE_HTML_DIR: str = "substack_html_pages"  # Name of the directory we'll save the .html essay files
+BASE_SUBSTACK_URL: str = "https://www.citriniresearch.com/"  # Substack you want to convert to markdown
+BASE_MD_DIR: str = "/Users/philkir/substacks"  # Name of the directory we'll save the .md essay files
+BASE_HTML_DIR: str = "/Users/philkir/substacks/html"  # Name of the directory we'll save the .html essay files
 HTML_TEMPLATE: str = "author_template.html"  # HTML template to use for the author page
 JSON_DATA_DIR: str = "data"
 NUM_POSTS_TO_SCRAPE: int = 3  # Set to 0 if you want all posts
@@ -815,7 +815,7 @@ def main():
         scraper.scrape_posts(args.number)
 
     else:  # Use the hardcoded values at the top of the file
-        if USE_PREMIUM:
+        if USE_PREMIUM or args.premium:
             scraper = PremiumSubstackScraper(
                 base_substack_url=BASE_SUBSTACK_URL,
                 md_save_dir=args.directory,
