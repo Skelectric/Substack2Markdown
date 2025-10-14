@@ -1,2 +1,15 @@
-EMAIL = "your-email@domain.com"
-PASSWORD = "your-password"
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Substack credentials - loaded from environment variables
+EMAIL = os.getenv("EMAIL")
+PASSWORD = os.getenv("PASSWORD")
+
+# Remote server configuration - loaded from environment variables
+REMOTE_SERVER = os.getenv("REMOTE_SERVER", "192.168.104.209")
+REMOTE_USER = os.getenv("REMOTE_USER", "ubuntu")
+REMOTE_BASE_DIR = os.getenv("REMOTE_BASE_DIR", "/home/ubuntu/substacks")
+REMOTE_HTML_DIR = os.getenv("REMOTE_HTML_DIR", "/home/ubuntu/substacks/html")
