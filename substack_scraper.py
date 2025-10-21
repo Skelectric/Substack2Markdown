@@ -22,7 +22,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service
 from urllib.parse import urlparse, urljoin
-from config import EMAIL, PASSWORD, REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, REMOTE_HTML_DIR
+from config import EMAIL, PASSWORD, REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, REMOTE_HTML_DIR, SSH_KEY_PATH
 
 USE_PREMIUM: bool = False  # Set to True if you want to login to Substack and convert paid for posts
 BASE_SUBSTACK_URL: str = "https://www.citriniresearch.com/"  # Substack you want to convert to markdown
@@ -106,11 +106,11 @@ class RemoteFileHandler:
     Handles file operations on a remote server via SSH/SCP
     """
     
-    def __init__(self, server: str, user: str, base_dir: str):
+    def __init__(self, server: str, user: str, base_dir: str, ssh_key_path: str = None):
         self.server = server
         self.user = user
         self.base_dir = base_dir
-        self.ssh_key_path = os.path.expanduser("~/.ssh/id_rsa")
+        self.ssh_key_path = os.path.expanduser(ssh_key_path or "~/.ssh/id_rsa")
         
         # Test connection on initialization
         if not self.test_connection():
@@ -134,44 +134,66 @@ class RemoteFileHandler:
         
     def _run_ssh_command(self, command: str, max_retries: int = 3) -> Tuple[bool, str]:
         """
-        Run an SSH command on the remote server with retry logic
+        Run an SSH command on the remote server with improved error logging and connection reuse
         """
         for attempt in range(max_retries):
             try:
+                # Use SSH with connection multiplexing for better performance
                 ssh_cmd = [
                     "ssh", 
                     "-i", self.ssh_key_path,
                     "-o", "StrictHostKeyChecking=no",
                     "-o", "ConnectTimeout=10",
+                    "-o", "ControlMaster=auto",
+                    "-o", "ControlPath=~/.ssh/control-%r@%h:%p",
+                    "-o", "ControlPersist=60",
                     f"{self.user}@{self.server}",
                     command
                 ]
                 
-                # print(f"[DEBUG] SSH command: {' '.join(ssh_cmd)}")
                 result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
-                
-                # print(f"[DEBUG] SSH return code: {result.returncode}")
-                # print(f"[DEBUG] SSH stdout: '{result.stdout}'")
-                # print(f"[DEBUG] SSH stderr: '{result.stderr}'")
                 
                 if result.returncode == 0:
                     return True, result.stdout
                 else:
-                    error_msg = result.stderr or result.stdout or "Unknown SSH error"
+                    # Enhanced error logging with command details
+                    error_details = []
+                    if result.stderr:
+                        error_details.append(f"stderr: {result.stderr}")
+                    if result.stdout:
+                        error_details.append(f"stdout: {result.stdout}")
+                    if result.returncode != 0:
+                        error_details.append(f"exit code: {result.returncode}")
+                    
+                    # Add command details for debugging
+                    error_details.append(f"command: {command}")
+                    
+                    error_msg = "; ".join(error_details) if error_details else "Unknown SSH error"
+                    
+                    # Check if this is a "file doesn't exist" case (normal behavior for test -f)
+                    is_file_check = command.startswith("test -f")
+                    is_exit_code_1 = result.returncode == 1
+                    is_no_stderr = not result.stderr
+                    
+                    if is_file_check and is_exit_code_1 and is_no_stderr:
+                        # This is normal "file doesn't exist" behavior, don't treat as error
+                        return False, error_msg
+                    
                     if attempt < max_retries - 1:
                         print(f"[ERROR] SSH command failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
-                        sleep(2)  # Wait before retry
+                        sleep(2)
                         continue
                     return False, error_msg
+                    
             except subprocess.TimeoutExpired:
                 if attempt < max_retries - 1:
-                    print(f"SSH command timed out (attempt {attempt + 1}/{max_retries})")
+                    print(f"[ERROR] SSH command timed out (attempt {attempt + 1}/{max_retries})")
                     sleep(2)
                     continue
                 return False, "SSH command timed out"
             except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"SSH command failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                    print(f"[ERROR] SSH command failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
                     sleep(2)
                     continue
                 return False, f"SSH command failed: {str(e)}"
@@ -189,6 +211,9 @@ class RemoteFileHandler:
                     "-i", self.ssh_key_path,
                     "-o", "StrictHostKeyChecking=no",
                     "-o", "ConnectTimeout=10",
+                    "-o", "ControlMaster=auto",
+                    "-o", "ControlPath=~/.ssh/control-%r@%h:%p",
+                    "-o", "ControlPersist=60",
                     local_path,
                     f"{self.user}@{self.server}:{remote_path}"
                 ]
@@ -206,7 +231,17 @@ class RemoteFileHandler:
                 if result.returncode == 0:
                     return True, result.stdout
                 else:
-                    error_msg = result.stderr or result.stdout or "Unknown SCP error"
+                    # Improved error logging - show actual error details
+                    error_details = []
+                    if result.stderr:
+                        error_details.append(f"stderr: {result.stderr}")
+                    if result.stdout:
+                        error_details.append(f"stdout: {result.stdout}")
+                    if result.returncode != 0:
+                        error_details.append(f"exit code: {result.returncode}")
+                    
+                    error_msg = "; ".join(error_details) if error_details else "Unknown SCP error"
+                    
                     if attempt < max_retries - 1:
                         print(f"[ERROR] SCP command failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
                         sleep(2)  # Wait before retry
@@ -254,6 +289,19 @@ class RemoteFileHandler:
         Check if a file exists on the remote server
         """
         success, output = self._run_ssh_command(f"test -f {remote_path}")
+        
+        # Handle the case where test -f returns exit code 1 (file doesn't exist)
+        # This is normal behavior, not an error
+        if not success:
+            # Check if the error is just "file doesn't exist" (exit code 1)
+            if "exit code: 1" in output and "stderr:" not in output:
+                # This is normal - file doesn't exist
+                return False
+            else:
+                # This is a real error (connection issue, permission problem, etc.)
+                print(f"[DEBUG] File existence check failed for {remote_path}: {output}")
+                return False
+        
         return success
     
     def save_file(self, content: str, remote_path: str) -> bool:
@@ -304,7 +352,7 @@ def generate_html_file(author_name: str) -> None:
     Generates a HTML file for the given author.
     """
     # Create remote file handler
-    remote_handler = RemoteFileHandler(REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR)
+    remote_handler = RemoteFileHandler(REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, SSH_KEY_PATH)
     
     # Ensure remote HTML directory exists
     remote_handler.ensure_directory_exists(REMOTE_HTML_DIR)
@@ -350,7 +398,7 @@ class BaseSubstackScraper(ABC):
 
         # Initialize remote file handler with fallback
         try:
-            self.remote_handler = RemoteFileHandler(REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR)
+            self.remote_handler = RemoteFileHandler(REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, SSH_KEY_PATH)
             self.use_remote = True
             
             # Test connection before proceeding
