@@ -64,12 +64,29 @@ cd Substack2Markdown
 pip install -r requirements.txt
 ```
 
-For the premium scraper, update the `config.py` in the root directory with your Substack email and password:
+For the premium scraper, create a `.env` file in the root directory with your configuration:
 
-```python
-EMAIL = "your-email@domain.com"
-PASSWORD = "your-password"
+```bash
+# Substack credentials
+EMAIL=your-email@domain.com
+PASSWORD=your-password
+
+# Remote server configuration (optional)
+REMOTE_SERVER=192.168.104.209
+REMOTE_USER=ubuntu
+REMOTE_BASE_DIR=/home/ubuntu/substacks
+REMOTE_HTML_DIR=/home/ubuntu/substacks/html
+
+# SSH key path - customize for your system
+# For macOS/Linux with default SSH key:
+SSH_KEY_PATH=~/.ssh/id_rsa
+# For systems with ed25519 keys:
+# SSH_KEY_PATH=~/.ssh/id_ed25519
+# For custom key names:
+# SSH_KEY_PATH=~/.ssh/id_ed25519_bazzite
 ```
+
+Alternatively, you can update the `config.py` file directly with your values.
 
 You'll also need Brave Browser installed for the Selenium webdriver (ChromeDriver will be automatically managed).
 

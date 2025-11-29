@@ -7,6 +7,8 @@ from time import sleep
 from datetime import datetime
 import re
 import hashlib
+import tempfile
+import subprocess
 
 from bs4 import BeautifulSoup
 import html2text
@@ -17,16 +19,15 @@ from xml.etree import ElementTree as ET
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service
 from urllib.parse import urlparse, urljoin
-from config import EMAIL, PASSWORD
+from config import EMAIL, PASSWORD, REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, REMOTE_HTML_DIR, SSH_KEY_PATH
 
 USE_PREMIUM: bool = False  # Set to True if you want to login to Substack and convert paid for posts
 BASE_SUBSTACK_URL: str = "https://www.citriniresearch.com/"  # Substack you want to convert to markdown
-BASE_MD_DIR: str = "/Users/philkir/substacks"  # Name of the directory we'll save the .md essay files
-BASE_HTML_DIR: str = "/Users/philkir/substacks/html"  # Name of the directory we'll save the .html essay files
+BASE_MD_DIR: str = REMOTE_BASE_DIR  # Remote directory for .md essay files
+BASE_HTML_DIR: str = REMOTE_HTML_DIR  # Remote directory for .html essay files
 HTML_TEMPLATE: str = "author_template.html"  # HTML template to use for the author page
 JSON_DATA_DIR: str = "data"
 NUM_POSTS_TO_SCRAPE: int = 3  # Set to 0 if you want all posts
@@ -100,12 +101,261 @@ def parse_date_to_iso(date_str: str) -> str:
     return date_str
 
 
+class RemoteFileHandler:
+    """
+    Handles file operations on a remote server via SSH/SCP
+    """
+    
+    def __init__(self, server: str, user: str, base_dir: str, ssh_key_path: str = None):
+        self.server = server
+        self.user = user
+        self.base_dir = base_dir
+        self.ssh_key_path = os.path.expanduser(ssh_key_path or "~/.ssh/id_rsa")
+        
+        # Test connection on initialization
+        if not self.test_connection():
+            raise ConnectionError(f"Could not connect to remote server {self.user}@{self.server}")
+    
+    def test_connection(self) -> bool:
+        """
+        Test SSH connection to the remote server
+        """
+        try:
+            success, output = self._run_ssh_command("echo 'Connection test successful'")
+            if success:
+                print(f"[OK] Successfully connected to {self.user}@{self.server}")
+                return True
+            else:
+                print(f"[ERROR] Failed to connect to {self.user}@{self.server}: {output}")
+                return False
+        except Exception as e:
+            print(f"[ERROR] Connection test failed: {e}")
+            return False
+        
+    def _run_ssh_command(self, command: str, max_retries: int = 3) -> Tuple[bool, str]:
+        """
+        Run an SSH command on the remote server with improved error logging and connection reuse
+        """
+        for attempt in range(max_retries):
+            try:
+                # Use SSH with connection multiplexing for better performance
+                ssh_cmd = [
+                    "ssh", 
+                    "-i", self.ssh_key_path,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=10",
+                    "-o", "ControlMaster=auto",
+                    "-o", "ControlPath=~/.ssh/control-%r@%h:%p",
+                    "-o", "ControlPersist=60",
+                    f"{self.user}@{self.server}",
+                    command
+                ]
+                
+                result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0:
+                    return True, result.stdout
+                else:
+                    # Enhanced error logging with command details
+                    error_details = []
+                    if result.stderr:
+                        error_details.append(f"stderr: {result.stderr}")
+                    if result.stdout:
+                        error_details.append(f"stdout: {result.stdout}")
+                    if result.returncode != 0:
+                        error_details.append(f"exit code: {result.returncode}")
+                    
+                    # Add command details for debugging
+                    error_details.append(f"command: {command}")
+                    
+                    error_msg = "; ".join(error_details) if error_details else "Unknown SSH error"
+                    
+                    # Check if this is a "file doesn't exist" case (normal behavior for test -f)
+                    is_file_check = command.startswith("test -f")
+                    is_exit_code_1 = result.returncode == 1
+                    is_no_stderr = not result.stderr
+                    
+                    if is_file_check and is_exit_code_1 and is_no_stderr:
+                        # This is normal "file doesn't exist" behavior, don't treat as error
+                        return False, error_msg
+                    
+                    if attempt < max_retries - 1:
+                        print(f"[ERROR] SSH command failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                        sleep(2)
+                        continue
+                    return False, error_msg
+                    
+            except subprocess.TimeoutExpired:
+                if attempt < max_retries - 1:
+                    print(f"[ERROR] SSH command timed out (attempt {attempt + 1}/{max_retries})")
+                    sleep(2)
+                    continue
+                return False, "SSH command timed out"
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"[ERROR] SSH command failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                    sleep(2)
+                    continue
+                return False, f"SSH command failed: {str(e)}"
+        
+        return False, "All SSH command attempts failed"
+    
+    def _run_scp_command(self, local_path: str, remote_path: str, max_retries: int = 3) -> Tuple[bool, str]:
+        """
+        Copy a file to the remote server using SCP with retry logic
+        """
+        for attempt in range(max_retries):
+            try:
+                scp_cmd = [
+                    "scp",
+                    "-i", self.ssh_key_path,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=10",
+                    "-o", "ControlMaster=auto",
+                    "-o", "ControlPath=~/.ssh/control-%r@%h:%p",
+                    "-o", "ControlPersist=60",
+                    local_path,
+                    f"{self.user}@{self.server}:{remote_path}"
+                ]
+                
+                # print(f"[DEBUG] SCP command: {' '.join(scp_cmd)}")
+                # print(f"[DEBUG] Local file exists: {os.path.exists(local_path)}")
+                # print(f"[DEBUG] Local file size: {os.path.getsize(local_path) if os.path.exists(local_path) else 'N/A'}")
+                
+                result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
+                
+                # print(f"[DEBUG] SCP return code: {result.returncode}")
+                # print(f"[DEBUG] SCP stdout: '{result.stdout}'")
+                # print(f"[DEBUG] SCP stderr: '{result.stderr}'")
+                
+                if result.returncode == 0:
+                    return True, result.stdout
+                else:
+                    # Improved error logging - show actual error details
+                    error_details = []
+                    if result.stderr:
+                        error_details.append(f"stderr: {result.stderr}")
+                    if result.stdout:
+                        error_details.append(f"stdout: {result.stdout}")
+                    if result.returncode != 0:
+                        error_details.append(f"exit code: {result.returncode}")
+                    
+                    error_msg = "; ".join(error_details) if error_details else "Unknown SCP error"
+                    
+                    if attempt < max_retries - 1:
+                        print(f"[ERROR] SCP command failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                        sleep(2)  # Wait before retry
+                        continue
+                    return False, error_msg
+            except subprocess.TimeoutExpired:
+                if attempt < max_retries - 1:
+                    print(f"[ERROR] SCP command timed out (attempt {attempt + 1}/{max_retries})")
+                    sleep(2)
+                    continue
+                return False, "SCP command timed out"
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"[ERROR] SCP command failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                    sleep(2)
+                    continue
+                return False, f"SCP command failed: {str(e)}"
+        
+        return False, "All SCP command attempts failed"
+    
+    def test_connection(self) -> bool:
+        """
+        Test SSH connection to the remote server
+        """
+        # print(f"[DEBUG] Testing SSH connection to {self.user}@{self.server}")
+        success, output = self._run_ssh_command("echo 'SSH connection test successful'")
+        if success:
+            print(f"[OK] SSH connection test passed: {output.strip()}")
+            return True
+        else:
+            print(f"[ERROR] SSH connection test failed: {output}")
+            return False
+    
+    def ensure_directory_exists(self, remote_path: str) -> bool:
+        """
+        Ensure a directory exists on the remote server
+        """
+        success, output = self._run_ssh_command(f"mkdir -p {remote_path}")
+        if not success:
+            print(f"Warning: Could not create directory {remote_path}: {output}")
+        return success
+    
+    def file_exists(self, remote_path: str) -> bool:
+        """
+        Check if a file exists on the remote server
+        """
+        success, output = self._run_ssh_command(f"test -f {remote_path}")
+        
+        # Handle the case where test -f returns exit code 1 (file doesn't exist)
+        # This is normal behavior, not an error
+        if not success:
+            # Check if the error is just "file doesn't exist" (exit code 1)
+            if "exit code: 1" in output and "stderr:" not in output:
+                # This is normal - file doesn't exist
+                return False
+            else:
+                # This is a real error (connection issue, permission problem, etc.)
+                print(f"[DEBUG] File existence check failed for {remote_path}: {output}")
+                return False
+        
+        return success
+    
+    def save_file(self, content: str, remote_path: str) -> bool:
+        """
+        Save content to a file on the remote server
+        """
+        # Create the directory if it doesn't exist
+        remote_dir = os.path.dirname(remote_path)
+        if not self.ensure_directory_exists(remote_dir):
+            return False
+        
+        # Write content to a temporary local file
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as temp_file:
+            temp_file.write(content)
+            temp_local_path = temp_file.name
+        
+        try:
+            # Copy the file to the remote server
+            success, output = self._run_scp_command(temp_local_path, remote_path)
+            if not success:
+                print(f"Error saving file {remote_path}: {output}")
+            return success
+        finally:
+            # Clean up the temporary file
+            os.unlink(temp_local_path)
+    
+    def download_file(self, remote_path: str, local_path: str) -> bool:
+        """
+        Download a file from the remote server
+        """
+        try:
+            scp_cmd = [
+                "scp",
+                "-i", self.ssh_key_path,
+                "-o", "StrictHostKeyChecking=no",
+                f"{self.user}@{self.server}:{remote_path}",
+                local_path
+            ]
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
+            return result.returncode == 0
+        except Exception as e:
+            print(f"Error downloading file {remote_path}: {str(e)}")
+            return False
+
+
 def generate_html_file(author_name: str) -> None:
     """
     Generates a HTML file for the given author.
     """
-    if not os.path.exists(BASE_HTML_DIR):
-        os.makedirs(BASE_HTML_DIR)
+    # Create remote file handler
+    remote_handler = RemoteFileHandler(REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, SSH_KEY_PATH)
+    
+    # Ensure remote HTML directory exists
+    remote_handler.ensure_directory_exists(REMOTE_HTML_DIR)
 
     # Read JSON data
     json_path = os.path.join(JSON_DATA_DIR, f'{author_name}.json')
@@ -125,10 +375,13 @@ def generate_html_file(author_name: str) -> None:
     )
     html_with_author = html_with_data.replace('author_name', author_name)
 
-    # Write the modified HTML to a new file
-    html_output_path = os.path.join(BASE_HTML_DIR, f'{author_name}.html')
-    with open(html_output_path, 'w', encoding='utf-8') as file:
-        file.write(html_with_author)
+    # Write the modified HTML to the remote server
+    html_output_path = os.path.join(REMOTE_HTML_DIR, f'{author_name}.html')
+    success = remote_handler.save_file(html_with_author, html_output_path)
+    if success:
+        print(f"Generated HTML file: {html_output_path}")
+    else:
+        print(f"Failed to generate HTML file: {html_output_path}")
 
 
 class BaseSubstackScraper(ABC):
@@ -143,12 +396,41 @@ class BaseSubstackScraper(ABC):
         self.md_save_dir: str = md_save_dir
         self.html_save_dir: str = f"{html_save_dir}/{self.writer_name}"
 
-        if not os.path.exists(md_save_dir):
-            os.makedirs(md_save_dir)
-            print(f"Created md directory {md_save_dir}")
-        if not os.path.exists(self.html_save_dir):
-            os.makedirs(self.html_save_dir)
-            print(f"Created html directory {self.html_save_dir}")
+        # Initialize remote file handler with fallback
+        try:
+            self.remote_handler = RemoteFileHandler(REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, SSH_KEY_PATH)
+            self.use_remote = True
+            
+            # Test connection before proceeding
+            if not self.remote_handler.test_connection():
+                print("[ERROR] SSH connection test failed, falling back to local mode")
+                self.use_remote = False
+                self.remote_handler = None
+            else:
+                # Ensure remote directories exist
+                if not self.remote_handler.ensure_directory_exists(md_save_dir):
+                    print(f"Warning: Could not create remote md directory {md_save_dir}")
+                else:
+                    print(f"Ensured remote md directory exists: {md_save_dir}")
+                
+                if not self.remote_handler.ensure_directory_exists(self.html_save_dir):
+                    print(f"Warning: Could not create remote html directory {self.html_save_dir}")
+                else:
+                    print(f"Ensured remote html directory exists: {self.html_save_dir}")
+                
+        except ConnectionError as e:
+            print(f"[WARNING] Remote connection failed: {e}")
+            print("Falling back to local file storage...")
+            self.use_remote = False
+            self.remote_handler = None
+            
+            # Create local directories as fallback
+            if not os.path.exists(md_save_dir):
+                os.makedirs(md_save_dir)
+                print(f"Created local md directory {md_save_dir}")
+            if not os.path.exists(self.html_save_dir):
+                os.makedirs(self.html_save_dir)
+                print(f"Created local html directory {self.html_save_dir}")
 
         self.keywords: List[str] = ["about", "archive", "podcast"]
         self.post_urls: List[str] = self.get_all_post_urls()
@@ -217,8 +499,7 @@ class BaseSubstackScraper(ABC):
         h.body_width = 0
         return h.handle(html_content)
 
-    @staticmethod
-    def save_to_file(filepath: str, content: str) -> None:
+    def save_to_file(self, filepath: str, content: str) -> None:
         """
         This method saves content to a file. Can be used to save HTML or Markdown
         """
@@ -228,12 +509,25 @@ class BaseSubstackScraper(ABC):
         if not isinstance(content, str):
             raise ValueError("content must be a string")
 
-        if os.path.exists(filepath):
-            print(f"File already exists: {filepath}")
-            return
+        if self.use_remote:
+            if self.remote_handler.file_exists(filepath):
+                print(f"File already exists: {filepath}")
+                return
 
-        with open(filepath, 'w', encoding='utf-8') as file:
-            file.write(content)
+            success = self.remote_handler.save_file(content, filepath)
+            if success:
+                print(f"Saved file: {filepath}")
+            else:
+                print(f"Failed to save file: {filepath}")
+        else:
+            # Local fallback
+            if os.path.exists(filepath):
+                print(f"File already exists: {filepath}")
+                return
+
+            with open(filepath, 'w', encoding='utf-8') as file:
+                file.write(content)
+            print(f"Saved file locally: {filepath}")
 
     @staticmethod
     def md_to_html(md_content: str) -> str:
@@ -247,10 +541,19 @@ class BaseSubstackScraper(ABC):
         Creates an images directory alongside the markdown files
         """
         images_dir = os.path.join(self.md_save_dir, "images")
-        if not os.path.exists(images_dir):
-            os.makedirs(images_dir)
-            print(f"Created images directory: {images_dir}")
-        return images_dir
+        if self.use_remote:
+            # Convert Windows path separators to Unix for remote server
+            remote_images_dir = images_dir.replace("\\", "/")
+            if not self.remote_handler.ensure_directory_exists(remote_images_dir):
+                print(f"Warning: Could not create remote images directory: {remote_images_dir}")
+            else:
+                print(f"Ensured remote images directory exists: {remote_images_dir}")
+            return remote_images_dir
+        else:
+            if not os.path.exists(images_dir):
+                os.makedirs(images_dir)
+                print(f"Created local images directory: {images_dir}")
+            return images_dir
 
     def extract_image_urls_from_markdown(self, markdown_content: str) -> List[str]:
         """
@@ -264,8 +567,8 @@ class BaseSubstackScraper(ABC):
 
     def download_image(self, image_url: str, images_dir: str) -> Optional[str]:
         """
-        Downloads an image from URL and saves it locally
-        Returns the local file path if successful, None if failed
+        Downloads an image from URL and saves it
+        Returns the file path if successful, None if failed
         """
         try:
             # Create a unique filename based on URL hash
@@ -282,22 +585,67 @@ class BaseSubstackScraper(ABC):
                 ext = '.jpg'
             
             filename = f"{url_hash}{ext}"
-            local_path = os.path.join(images_dir, filename)
+            if self.use_remote:
+                # For remote, use forward slashes
+                file_path = f"{images_dir}/{filename}"
+            else:
+                # For local, use os.path.join
+                file_path = os.path.join(images_dir, filename)
             
             # Skip if file already exists
-            if os.path.exists(local_path):
-                return local_path
+            if self.use_remote:
+                if self.remote_handler.file_exists(file_path):
+                    return file_path
+            else:
+                if os.path.exists(file_path):
+                    return file_path
             
             # Download the image
-            response = requests.get(image_url, stream=True, timeout=30)
-            response.raise_for_status()
+            try:
+                # print(f"[DEBUG] Downloading image: {image_url}")
+                response = requests.get(image_url, stream=True, timeout=30)
+                response.raise_for_status()
+                # print(f"[DEBUG] Image download successful, size: {len(response.content)} bytes")
+            except requests.exceptions.RequestException as e:
+                # print(f"[ERROR] Failed to download image {image_url}: {e}")
+                return None
             
-            # Save the image
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            return local_path
+            if self.use_remote:
+                # Save to temporary local file first, then upload
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            temp_file.write(chunk)
+                        temp_local_path = temp_file.name
+                    
+                    # print(f"[DEBUG] Temporary file created: {temp_local_path}")
+                    
+                    # Copy the image to the remote server
+                    success, output = self.remote_handler._run_scp_command(temp_local_path, file_path)
+                    if success:
+                        print(f"[OK] Image uploaded successfully: {file_path}")
+                        return file_path
+                    else:
+                        print(f"[ERROR] Failed to upload image {image_url}: {output}")
+                        return None
+                except Exception as e:
+                    print(f"[ERROR] Error processing image {image_url}: {e}")
+                    return None
+                finally:
+                    # Clean up the temporary file
+                    if 'temp_local_path' in locals() and os.path.exists(temp_local_path):
+                        os.unlink(temp_local_path)
+            else:
+                # Save directly to local file
+                try:
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    print(f"[OK] Image saved locally: {file_path}")
+                    return file_path
+                except Exception as e:
+                    print(f"[ERROR] Failed to save image locally {image_url}: {e}")
+                    return None
             
         except Exception as e:
             print(f"Failed to download image {image_url}: {e}")
@@ -305,15 +653,15 @@ class BaseSubstackScraper(ABC):
 
     def replace_image_urls_in_markdown(self, markdown_content: str, images_dir: str) -> str:
         """
-        Replaces image URLs in markdown content with relative local paths
+        Replaces image URLs in markdown content with relative remote paths
         """
         image_urls = self.extract_image_urls_from_markdown(markdown_content)
         
         for image_url in image_urls:
-            local_path = self.download_image(image_url, images_dir)
-            if local_path:
+            remote_path = self.download_image(image_url, images_dir)
+            if remote_path:
                 # Calculate relative path from markdown file to image
-                relative_path = os.path.relpath(local_path, self.md_save_dir)
+                relative_path = os.path.relpath(remote_path, self.md_save_dir)
                 # Ensure forward slashes for markdown compatibility
                 relative_path = relative_path.replace("\\", "/")
                 
@@ -355,8 +703,16 @@ class BaseSubstackScraper(ABC):
             </html>
         """
 
-        with open(filepath, 'w', encoding='utf-8') as file:
-            file.write(html_content)
+        if self.use_remote:
+            success = self.remote_handler.save_file(html_content, filepath)
+            if success:
+                print(f"Saved HTML file: {filepath}")
+            else:
+                print(f"Failed to save HTML file: {filepath}")
+        else:
+            with open(filepath, 'w', encoding='utf-8') as file:
+                file.write(html_content)
+            print(f"Saved HTML file locally: {filepath}")
 
     @staticmethod
     def get_filename_from_url(url: str, filetype: str = ".md", date: str = "") -> str:
@@ -436,6 +792,7 @@ class BaseSubstackScraper(ABC):
     def save_essays_data_to_json(self, essays_data: list) -> None:
         """
         Saves essays data to a JSON file for a specific author.
+        Note: JSON data is stored locally, but file paths in the JSON point to remote locations.
         """
         data_dir = os.path.join(JSON_DATA_DIR)
         if not os.path.exists(data_dir):
@@ -476,10 +833,23 @@ class BaseSubstackScraper(ABC):
                 # Generate filenames with date prefix
                 md_filename = self.get_filename_from_url(url, filetype=".md", date=date)
                 html_filename = self.get_filename_from_url(url, filetype=".html", date=date)
-                md_filepath = os.path.join(self.md_save_dir, md_filename)
-                html_filepath = os.path.join(self.html_save_dir, html_filename)
+                
+                if self.use_remote:
+                    # For remote, use forward slashes
+                    md_filepath = f"{self.md_save_dir}/{md_filename}"
+                    html_filepath = f"{self.html_save_dir}/{html_filename}"
+                else:
+                    # For local, use os.path.join
+                    md_filepath = os.path.join(self.md_save_dir, md_filename)
+                    html_filepath = os.path.join(self.html_save_dir, html_filename)
 
-                if not os.path.exists(md_filepath):
+                file_exists = False
+                if self.use_remote:
+                    file_exists = self.remote_handler.file_exists(md_filepath)
+                else:
+                    file_exists = os.path.exists(md_filepath)
+                
+                if not file_exists:
                     self.save_to_file(md_filepath, md)
 
                     # Convert markdown to HTML and save
@@ -540,8 +910,27 @@ class PremiumSubstackScraper(BaseSubstackScraper):
         options = ChromeOptions()
         if headless:
             options.add_argument("--headless")
+        
+        # Set Brave Browser path if not specified
         if chrome_path:
             options.binary_location = chrome_path
+        else:
+            # Try to find Brave Browser on Windows
+            import platform
+            if platform.system() == "Windows":
+                brave_paths = [
+                    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                    r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+                    os.path.expanduser(r"~\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe")
+                ]
+                for path in brave_paths:
+                    if os.path.exists(path):
+                        options.binary_location = path
+                        print(f"Found Brave Browser at: {path}")
+                        break
+                else:
+                    print("Brave Browser not found in common locations. Using system default Chrome/Chromium.")
+        
         if user_agent:
             options.add_argument(f'user-agent={user_agent}')  # Pass this if running headless and blocked by captcha
 
@@ -551,15 +940,13 @@ class PremiumSubstackScraper(BaseSubstackScraper):
         options.add_argument("--disable-gpu")
         options.add_argument("--remote-debugging-port=9222")
 
+        # Use Selenium Manager (built into Selenium 4.6+) to automatically handle driver management
+        # This will work on Windows, macOS, and Linux
         if chrome_driver_path:
             service = Service(executable_path=chrome_driver_path)
         else:
-            # Try to use the Homebrew-installed ChromeDriver first
-            homebrew_chromedriver = "/opt/homebrew/bin/chromedriver"
-            if os.path.exists(homebrew_chromedriver):
-                service = Service(executable_path=homebrew_chromedriver)
-            else:
-                service = Service(ChromeDriverManager().install())
+            # Let Selenium Manager handle driver download and management automatically
+            service = Service()
 
         self.driver = webdriver.Chrome(service=service, options=options)
         self.login()
@@ -603,7 +990,7 @@ class PremiumSubstackScraper(BaseSubstackScraper):
         sleep(5)  # Wait for initial response
         
         # Wait for potential captcha completion and manual intervention
-        print("⏳ Waiting for login process to complete...")
+        print("[WAITING] Waiting for login process to complete...")
         print("If you see a captcha, popup, or need to click login, please handle it now.")
         
         # Wait for successful login
@@ -618,14 +1005,14 @@ class PremiumSubstackScraper(BaseSubstackScraper):
                 
                 # Check if we've left the sign-in page
                 if "substack.com" in current_url and "sign-in" not in current_url:
-                    print("✓ Login successful")
+                    print("[OK] Login successful")
                     login_successful = True
                     break
                 
                 # Check for error messages
                 error_elements = self.driver.find_elements(By.XPATH, "//*[contains(@class, 'error') or contains(text(), 'Invalid')]")
                 if error_elements:
-                    print(f"✗ Login error: {[e.text for e in error_elements if e.text]}")
+                    print(f"[ERROR] Login error: {[e.text for e in error_elements if e.text]}")
                     
             except Exception as e:
                 print(f"Error checking login status: {e}")
@@ -634,7 +1021,7 @@ class PremiumSubstackScraper(BaseSubstackScraper):
             wait_time += 10
             
         if not login_successful:
-            print("⚠ Login verification timeout - proceeding anyway")
+            print("[WARNING] Login verification timeout - proceeding anyway")
 
         if self.is_login_failed():
             raise Exception(
@@ -666,7 +1053,7 @@ class PremiumSubstackScraper(BaseSubstackScraper):
                 close_buttons = self.driver.find_elements(By.XPATH, selector)
                 for button in close_buttons:
                     if button.is_displayed() and button.is_enabled():
-                        print("🔘 Closing popup/modal...")
+                        print("[ACTION] Closing popup/modal...")
                         button.click()
                         sleep(2)
                         return
@@ -692,7 +1079,7 @@ class PremiumSubstackScraper(BaseSubstackScraper):
                 login_buttons = self.driver.find_elements(By.XPATH, selector)
                 for button in login_buttons:
                     if button.is_displayed() and button.is_enabled():
-                        print("🔘 Clicking login button...")
+                        print("[ACTION] Clicking login button...")
                         button.click()
                         sleep(3)
                         return
@@ -761,14 +1148,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chrome-path",
         type=str,
-        default="/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-        help='Optional: The path to the Chrome/Brave browser executable. Defaults to Brave Browser on macOS.',
+        default="",
+        help='Optional: The path to the Chrome/Brave browser executable. If not specified, will use system default.',
     )
     parser.add_argument(
         "--chrome-driver-path",
         type=str,
-        default="/opt/homebrew/bin/chromedriver",
-        help='Optional: The path to the Chrome WebDriver executable. Defaults to Homebrew installation.',
+        default="",
+        help='Optional: The path to the Chrome WebDriver executable. If not specified, Selenium Manager will handle it automatically.',
     )
     parser.add_argument(
         "--user-agent",
