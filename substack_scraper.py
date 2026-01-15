@@ -21,6 +21,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from urllib.parse import urlparse, urljoin
 from config import EMAIL, PASSWORD, REMOTE_SERVER, REMOTE_USER, REMOTE_BASE_DIR, REMOTE_HTML_DIR, SSH_KEY_PATH
 
@@ -31,6 +32,87 @@ BASE_HTML_DIR: str = REMOTE_HTML_DIR  # Remote directory for .html essay files
 HTML_TEMPLATE: str = "author_template.html"  # HTML template to use for the author page
 JSON_DATA_DIR: str = "data"
 NUM_POSTS_TO_SCRAPE: int = 3  # Set to 0 if you want all posts
+
+
+def get_chrome_version(chrome_path: str = None) -> Optional[str]:
+    """
+    Detect Chrome browser version from the binary.
+    Returns version string like '142.0.7444.175' or None if detection fails.
+    """
+    import platform
+    import json
+    
+    # Try to get version using Chrome's --version flag
+    chrome_binary = chrome_path
+    if not chrome_binary:
+        # Try common Chrome locations
+        system = platform.system()
+        if system == "Darwin":  # macOS
+            chrome_paths = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                os.path.expanduser("~/Library/Application Support/Google/Chrome/Default"),
+            ]
+            # Check for Chrome for Testing in cache (used by Selenium)
+            cache_path = os.path.expanduser("~/.cache/selenium/chrome")
+            if os.path.exists(cache_path):
+                for root, dirs, files in os.walk(cache_path):
+                    for d in dirs:
+                        test_path = os.path.join(root, d, "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
+                        if os.path.exists(test_path):
+                            chrome_paths.insert(0, test_path)
+        elif system == "Windows":
+            chrome_paths = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ]
+        else:  # Linux
+            chrome_paths = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/chromium",
+            ]
+        
+        for path in chrome_paths:
+            if os.path.exists(path):
+                chrome_binary = path
+                break
+    
+    if not chrome_binary or not os.path.exists(chrome_binary):
+        return None
+    
+    try:
+        # Try --version flag
+        result = subprocess.run(
+            [chrome_binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            # Extract version number (e.g., "Google Chrome 142.0.7444.175" -> "142.0.7444.175")
+            version_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', result.stdout)
+            if version_match:
+                return version_match.group(1)
+    except Exception:
+        pass
+    
+    try:
+        # Try --version --format=json (newer Chrome versions)
+        result = subprocess.run(
+            [chrome_binary, "--version", "--format=json"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            if "browser_version" in data:
+                return data["browser_version"]
+    except Exception:
+        pass
+    
+    return None
 
 
 def extract_main_part(url: str) -> str:
@@ -911,25 +993,73 @@ class PremiumSubstackScraper(BaseSubstackScraper):
         if headless:
             options.add_argument("--headless")
         
-        # Set Brave Browser path if not specified
+        # Set Chrome/Brave Browser path if not specified
+        import platform
         if chrome_path:
             options.binary_location = chrome_path
         else:
-            # Try to find Brave Browser on Windows
-            import platform
-            if platform.system() == "Windows":
-                brave_paths = [
-                    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-                    r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-                    os.path.expanduser(r"~\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe")
-                ]
-                for path in brave_paths:
-                    if os.path.exists(path):
-                        options.binary_location = path
-                        print(f"Found Brave Browser at: {path}")
+            # Try to find Chrome for Testing (used by Selenium Manager) first
+            cache_path = os.path.expanduser("~/.cache/selenium/chrome")
+            chrome_for_testing_found = False
+            if os.path.exists(cache_path):
+                # Look for Chrome for Testing in cache
+                for root, dirs, files in os.walk(cache_path):
+                    for d in dirs:
+                        if platform.system() == "Darwin":  # macOS
+                            test_path = os.path.join(root, d, "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
+                        elif platform.system() == "Windows":
+                            test_path = os.path.join(root, d, "chrome.exe")
+                        else:  # Linux
+                            test_path = os.path.join(root, d, "chrome")
+                        
+                        if os.path.exists(test_path):
+                            options.binary_location = test_path
+                            print(f"Found Chrome for Testing at: {test_path}")
+                            chrome_for_testing_found = True
+                            break
+                    if chrome_for_testing_found:
                         break
-                else:
-                    print("Brave Browser not found in common locations. Using system default Chrome/Chromium.")
+            
+            # If Chrome for Testing not found, try standard locations
+            if not chrome_for_testing_found:
+                if platform.system() == "Windows":
+                    brave_paths = [
+                        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+                        os.path.expanduser(r"~\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"),
+                        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                    ]
+                    for path in brave_paths:
+                        if os.path.exists(path):
+                            options.binary_location = path
+                            print(f"Found browser at: {path}")
+                            break
+                    else:
+                        print("Browser not found in common locations. Using system default.")
+                elif platform.system() == "Darwin":  # macOS
+                    chrome_paths = [
+                        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                        "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                    ]
+                    for path in chrome_paths:
+                        if os.path.exists(path):
+                            options.binary_location = path
+                            print(f"Found browser at: {path}")
+                            break
+                    else:
+                        print("Chrome not found in standard locations. Selenium Manager will handle it.")
+                else:  # Linux
+                    chrome_paths = [
+                        "/usr/bin/google-chrome",
+                        "/usr/bin/chromium-browser",
+                        "/usr/bin/chromium",
+                    ]
+                    for path in chrome_paths:
+                        if os.path.exists(path):
+                            options.binary_location = path
+                            print(f"Found browser at: {path}")
+                            break
         
         if user_agent:
             options.add_argument(f'user-agent={user_agent}')  # Pass this if running headless and blocked by captcha
@@ -940,13 +1070,35 @@ class PremiumSubstackScraper(BaseSubstackScraper):
         options.add_argument("--disable-gpu")
         options.add_argument("--remote-debugging-port=9222")
 
-        # Use Selenium Manager (built into Selenium 4.6+) to automatically handle driver management
-        # This will work on Windows, macOS, and Linux
+        # Use webdriver-manager or Selenium Manager to automatically download ChromeDriver
         if chrome_driver_path:
             service = Service(executable_path=chrome_driver_path)
         else:
-            # Let Selenium Manager handle driver download and management automatically
-            service = Service()
+            # Detect Chrome version for better driver matching
+            detected_chrome_path = chrome_path if chrome_path else (options.binary_location if options.binary_location else None)
+            chrome_version = get_chrome_version(detected_chrome_path)
+            if chrome_version:
+                print(f"Detected Chrome version: {chrome_version}")
+            
+            # Try webdriver-manager first, fallback to Selenium Manager
+            try:
+                driver_manager = ChromeDriverManager()
+                # Try to help webdriver-manager use the detected Chrome version
+                if chrome_version and hasattr(driver_manager, 'driver'):
+                    try:
+                        if hasattr(driver_manager.driver, 'get_browser_version_from_os'):
+                            driver_manager.driver.get_browser_version_from_os = lambda: chrome_version
+                            print(f"Using Chrome version {chrome_version} for driver selection")
+                    except (AttributeError, Exception):
+                        pass  # Continue if patching fails
+                
+                driver_path = driver_manager.install()
+                service = Service(executable_path=driver_path)
+                print(f"Using ChromeDriver from webdriver-manager: {driver_path}")
+            except (AttributeError, Exception) as e:
+                # Fallback to Selenium Manager (built into Selenium 4.6+)
+                print(f"webdriver-manager had issues ({type(e).__name__}), using Selenium Manager instead")
+                service = Service()
 
         self.driver = webdriver.Chrome(service=service, options=options)
         self.login()
